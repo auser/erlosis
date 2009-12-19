@@ -10,26 +10,49 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/1]).
+-export ([
+  show/0,
+  flush/0,
+  add_repos/1,
+  remove_repos/1,
+  add_user_to_repos/3,
+  remove_user_from_repos/3,
+  add_user/2,
+  reload/0,
+  commit/0
+]).
+
+-export([start_link/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
 -record(state, {
-  gitosis_config
+  gitosis_config,
+  config
 }).
 -define(SERVER, ?MODULE).
 
 %%====================================================================
 %% API
 %%====================================================================
+show() -> gen_server:call(?SERVER, {show}).
+add_repos(Name) -> gen_server:call(?SERVER, {add_repos, Name}).
+remove_repos(Name) -> gen_server:call(?SERVER, {remove_repos, Name}).
+add_user_to_repos(UserName, Name, Type) -> gen_server:call(?SERVER, {add_user_to_repos, Name, UserName, Type}).
+remove_user_from_repos(UserName, Name, Type) -> gen_server:call(?SERVER, {remove_user_from_repos, Name, UserName, Type}).
+add_user(UserName, Pubkey) -> gen_server:call(?SERVER, {add_new_user_and_key, UserName, Pubkey}).
+flush() -> gen_server:call(?SERVER, {flush}).
+reload() -> gen_server:call(?SERVER, {reload}).
+commit() -> gen_server:cast(?SERVER, {commit}).
+  
 %%--------------------------------------------------------------------
 %% Function: start_link() -> {ok,Pid} | ignore | {error,Error}
 %% Description: Starts the server
 %%--------------------------------------------------------------------
-start_link(ConfigFile) ->
-  gen_server:start_link({local, ?SERVER}, ?MODULE, [ConfigFile], []).
+start_link() ->
+  gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
 %%====================================================================
 %% gen_server callbacks
@@ -42,9 +65,12 @@ start_link(ConfigFile) ->
 %%                         {stop, Reason}
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
-init([ConfigFile]) ->
+init([]) ->
+  {ok, ConfigFile} = application:get_env(erlosis, config_file),
+  Config = conf_reader:parse_file(ConfigFile),
   {ok, #state{
-    gitosis_config = ConfigFile
+    gitosis_config = filename:absname(ConfigFile),
+    config = Config
   }}.
 
 %%--------------------------------------------------------------------
@@ -56,6 +82,30 @@ init([ConfigFile]) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
+handle_call({show}, _From, #state{config = Config} = State) ->
+  Reply = handle_show(Config),
+  {reply, Reply, State};
+handle_call({add_repos, Name}, _From, #state{config = Config} = State) ->
+  NewState = handle_add_repos(Name, Config, State),
+  {reply, ok, NewState};
+handle_call({remove_repos, Name}, _From, #state{config = Config} = State) ->
+  NewState = handle_remove_repos(Name, Config, State),
+  {reply, ok, NewState};
+handle_call({add_user_to_repos, Name, UserName, Type}, _From, State) ->
+  NewState = handle_add_user_to_repos(Name, UserName, Type, State),
+  {reply, ok, NewState};
+handle_call({remove_user_from_repos, Name, UserName, Type}, _From, State) ->
+  NewState = handle_remove_user_from_repos(Name, UserName, Type, State),
+  {reply, ok, NewState};
+handle_call({add_new_user_and_key, UserName, Pubkey}, _From, State) ->
+  NewState = handle_add_new_user_and_key(UserName, Pubkey, State),
+  {reply, ok, NewState};
+handle_call({flush}, _From, State) ->
+  Reply = flush(State),
+  {reply, Reply, State};
+handle_call({reload}, _From, #state{gitosis_config = ConfigFile} = State) ->
+  Config = conf_reader:parse_file(ConfigFile),
+  {reply, ok, State#state{config = Config}};
 handle_call(_Request, _From, State) ->
   Reply = ok,
   {reply, Reply, State}.
@@ -66,6 +116,9 @@ handle_call(_Request, _From, State) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
+handle_cast({commit}, #state{gitosis_config = ConfigFile} = State) ->
+  handle_commit(ConfigFile),
+  {noreply, State};
 handle_cast(_Msg, State) ->
   {noreply, State}.
 
@@ -98,3 +151,124 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
+handle_show(Config) -> handle_show(Config, []).
+handle_show([], Acc) -> lists:reverse(Acc);
+handle_show([{K, _V}|Rest], Acc) ->
+  Key = erlang:atom_to_list(K),
+  case string:substr(Key, 1, 6) =:= "group " of
+    true -> 
+      Name = string:substr(Key, 7, string:len(Key)),
+      handle_show(Rest, [Name|Acc]);
+    false -> handle_show(Rest, Acc)
+  end.
+  
+handle_add_repos(undefined, _Config, State) -> State;
+handle_add_repos(Name, Config, State) ->
+  GroupName = erlang:list_to_atom(lists:append(["group ", Name])),
+  NewConfig = case proplists:get_value(GroupName, Config) of
+    undefined ->
+      % New repos
+      [{GroupName, [{writable, [Name]}]}|Config];
+    _ -> 
+      Config
+  end,
+  NewState = State#state{config = NewConfig},
+  flush(NewState),
+  NewState.
+
+handle_remove_repos(undefined, _Config, _State) -> ok;
+handle_remove_repos(Name, Config, State) ->
+  GroupName = erlang:list_to_atom(lists:append(["group ", Name])),
+  NewConfig = case proplists:is_defined(GroupName, Config) of
+    true  -> proplists:delete(GroupName, Config);
+    false -> Config
+  end,
+  NewState = State#state{config = NewConfig},
+  flush(NewState),
+  NewState.
+
+handle_add_user_to_repos(Name, UserName, Type, #state{config = Config} = State) ->
+  case find_already_defined_repos(Name, Config) of
+    {error, not_found} -> 
+      NewState = handle_add_repos(Name, Config, State),
+      handle_add_user_to_repos(Name, UserName, Type, NewState);
+    {ok, Key, Repos} ->
+      NewReposConfig = case proplists:get_value(Type, Repos) of
+        undefined -> [{Type, [UserName]}|Repos];
+        CurrentMembers -> 
+          case lists:member(UserName, CurrentMembers) of
+            false ->
+              OldRepos = proplists:delete(Type, Repos),
+              [{Type, [UserName|CurrentMembers]}|OldRepos];
+            _ -> Repos
+          end
+      end,
+      OldConfig = proplists:delete(Key, Config),
+      NewConfig = [{Key, NewReposConfig}|OldConfig],
+      NewState = State#state{config = NewConfig},
+      flush(NewState),
+      NewState
+  end.
+  
+handle_remove_user_from_repos(Name, UserName, Type, #state{config = Config} = State) ->
+  case find_already_defined_repos(Name, Config) of
+    {error, not_found} -> ok;
+    {ok, Key, ReposConfig} ->
+      NewReposConfig = case proplists:get_value(Type, ReposConfig) of
+        undefined -> [{Type, [Name]}|ReposConfig];
+        CurrentMembers -> 
+          case lists:member(UserName, CurrentMembers) of
+            true ->
+              OldRepos = proplists:delete(Type, ReposConfig),
+              NewMembers = lists:delete(UserName, CurrentMembers),
+              [{Type, NewMembers}|OldRepos];
+            _ -> ReposConfig
+          end
+      end,
+      OldConfig = proplists:delete(Key, Config),
+      NewConfig = [{Key, NewReposConfig}|OldConfig],
+      NewState = State#state{config = NewConfig},
+      flush(NewState),
+      NewState
+      
+  end.
+
+handle_add_new_user_and_key(UserName, Pubkey, #state{gitosis_config = ConfigFile} = State) ->
+  case find_file_by_name(UserName, State) of
+    {error, not_found} -> 
+      Dirname = filename:dirname(ConfigFile),
+      PubKeyfile = filename:join([Dirname, "keydir", lists:append(UserName, ".pub")]),
+      {ok, Fd} = file:open(PubKeyfile, [write]),
+      file:write(Fd, Pubkey),
+      file:close(Fd);
+    {ok, _Pubname}  -> ok
+  end,
+  State.
+
+find_already_defined_repos(_Name, []) -> {error, not_found};
+find_already_defined_repos(Name, [{K, V}|Rest]) ->
+  Key = erlang:atom_to_list(K),
+  case string:substr(Key, 1, 6) =:= "group " of
+    true -> {ok, K, V};
+    false -> find_already_defined_repos(Name, Rest)
+  end.
+
+flush(#state{config = Config, gitosis_config = ConfigFile} = _State) ->
+  conf_writer:write(Config, ConfigFile).
+
+find_file_by_name(Name, #state{gitosis_config = ConfigFile} = _State) ->
+  {ok, Files} = file:list_dir(filename:dirname(ConfigFile)),
+  find_file_by_name1(Name, Files).
+
+find_file_by_name1(_Name, []) -> {error, not_found};
+find_file_by_name1(Name, [K|Rest]) ->
+  Pubname = lists:append([Name, ".pub"]),
+  case K =:= Pubname of
+    true -> {ok, Pubname};
+    false -> find_file_by_name1(Name, Rest)
+  end.
+
+handle_commit(ConfigFile) ->
+  Dirname = filename:dirname(ConfigFile),
+  Command = lists:append(["cd ", Dirname, " && ", "git commit -a -m 'Updated from erlosis'", " && ", "git push origin master"]),
+  os:cmd(Command).

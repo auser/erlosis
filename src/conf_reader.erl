@@ -138,11 +138,6 @@ parse_section_title(<<Ch,Rest/binary>>, Acc) -> parse_section_title(Rest, [Ch|Ac
 % Chomp the string for erroneous whitespace before and after
 chomp(Str) -> 
   lists:reverse(string:strip(Str)).
-% chomp(Str) -> chomp(Str, []).
-% chomp([], Acc) -> Acc;
-% chomp([32|Rest], Acc) -> chomp(Rest, Acc);
-% chomp([Chr|Rest], Acc) ->
-%   chomp(Rest, [Chr|Acc]).
 
 -ifdef (debug).
 
@@ -165,12 +160,14 @@ parse_section_title_test_() ->
     ?_assertEqual(parse_section_title(<<"box]\n\n#hello world\n">>), {box, <<"\n\n#hello world\n">>})
   ].
 
-just_for_show_test_() ->
+full_parse_test_() ->
   Data = parse_file("env/gitosis.conf"),
   GitosisVal = proplists:get_value(gitosis, Data),
   AnotherGroup = proplists:get_value('group anothergroup', Data),
+  TestRepos = proplists:get_value('group test_repos', Data),
   [
     ?_assertEqual([{members, ["alice", "bill"]}], AnotherGroup),
+    ?_assertEqual([], TestRepos),
     ?_assertEqual([{gitweb, ["no"]}], GitosisVal)
   ].
   
