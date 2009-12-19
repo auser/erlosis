@@ -13,6 +13,7 @@
 -export ([
   show/0,
   flush/0,
+  add_config/1,
   add_repos/1,
   remove_repos/1,
   add_user_to_repos/3,
@@ -38,6 +39,7 @@
 %% API
 %%====================================================================
 show() -> gen_server:call(?SERVER, {show}).
+add_config(Proplist) -> gen_server:call(?SERVER, {add_config, Proplist}).
 add_repos(Name) -> gen_server:call(?SERVER, {add_repos, Name}).
 remove_repos(Name) -> gen_server:call(?SERVER, {remove_repos, Name}).
 add_user_to_repos(UserName, Name, Type) -> gen_server:call(?SERVER, {add_user_to_repos, Name, UserName, Type}).
@@ -85,6 +87,9 @@ init([]) ->
 handle_call({show}, _From, #state{config = Config} = State) ->
   Reply = handle_show(Config),
   {reply, Reply, State};
+handle_call({add_config, Proplist}, _From, #state{config = Config} = State) ->
+  NewState = handle_add_config(Proplist, Config, State),
+  {reply, ok, NewState};
 handle_call({add_repos, Name}, _From, #state{config = Config} = State) ->
   NewState = handle_add_repos(Name, Config, State),
   {reply, ok, NewState};
@@ -151,6 +156,18 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 %%% Internal functions
 %%--------------------------------------------------------------------
+handle_add_config(Proplist, Config, State) ->
+  NewConfig = case proplists:get_value(gitosis, Config) of
+    undefined -> 
+      [{gitosis, Proplist}|Config];
+    GitosisConfig ->
+      OldConfig = lists:delete(gitosis, Config),
+      [{gitosis, lists:append([Proplist,GitosisConfig])}|OldConfig]
+  end,
+  NewState = State#state{config = NewConfig},
+  flush(NewState),
+  NewState.
+
 handle_show(Config) -> handle_show(Config, []).
 handle_show([], Acc) -> lists:reverse(Acc);
 handle_show([{K, _V}|Rest], Acc) ->
@@ -270,5 +287,7 @@ find_file_by_name1(Name, [K|Rest]) ->
 
 handle_commit(ConfigFile) ->
   Dirname = filename:dirname(ConfigFile),
-  Command = lists:append(["cd ", Dirname, " && ", "git commit -a -m 'Updated from erlosis'", " && ", "git push origin master"]),
+  Command = lists:append(["cd ", Dirname, " && ", 
+    "git add . && ",
+    "git commit -a -m 'Updated from erlosis'", " && ", "git push origin master"]),
   os:cmd(Command).

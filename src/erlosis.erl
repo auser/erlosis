@@ -21,7 +21,7 @@
 show_repos() ->                             erlosis_srv:show().
 add_repos(Name) ->                          erlosis_srv:add_repos(Name).
 remove_repos(Name) ->                       erlosis_srv:remove_repos(Name).
-add_user_to_repos(Name, UserName) ->        erlosis_srv:add_user_to_repos(Name, UserName, member).
-remove_user_from_repos(Name, UserName) ->   erlosis_srv:remove_user_from_repos(Name, UserName, member).
+add_user_to_repos(Name, UserName) ->        erlosis_srv:add_user_to_repos(Name, UserName, members).
+remove_user_from_repos(Name, UserName) ->   erlosis_srv:remove_user_from_repos(Name, UserName, members).
 add_user(UserName, Pubkey) ->               erlosis_srv:add_user(UserName, Pubkey).
 commit() ->                                 erlosis_srv:commit().
