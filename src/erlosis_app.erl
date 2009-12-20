@@ -12,6 +12,8 @@
 
 -export([start/2, stop/1]).
 
-start(_Type, _Args) -> erlosis_srv_sup:start_link().
+start(_Type, _Args) -> 
+  lists:map(fun(A) -> application:start(A) end, [crypto, ssh]),
+  erlosis_sup:start_link().
 
 stop(_State) -> ok.
