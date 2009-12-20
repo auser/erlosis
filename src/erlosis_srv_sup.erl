@@ -41,6 +41,7 @@ start_link() ->
 %%--------------------------------------------------------------------
 init([]) ->
   AppSrv = {the_erlosis_srv,{erlosis_srv, start_link,[]}, permanent,2000,worker,dynamic},
+  
   {ok,{{one_for_one,5,10}, [AppSrv]}}.
 
 %%====================================================================

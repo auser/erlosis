@@ -11,15 +11,18 @@
 
 %% API
 -export ([
-  show/0,
+  list_repos/0,
   flush/0,
+  has_git_repos/1,
   add_config/1,
   add_repos/1,
   remove_repos/1,
-  add_user_to_repos/3,
-  remove_user_from_repos/3,
+  add_user_to_repos/2,add_user_to_repos/3,
+  remove_user_from_repos/2,remove_user_from_repos/3,
   add_user/2,
   reload/0,
+  make_repos_public/1,
+  make_repos_private/1,
   commit/0
 ]).
 
@@ -38,14 +41,19 @@
 %%====================================================================
 %% API
 %%====================================================================
-show() -> gen_server:call(?SERVER, {show}).
+list_repos() -> gen_server:call(?SERVER, {list_repos}).
+has_git_repos(Name) -> gen_server:call(?SERVER, {has_git_repos, Name}).
 add_config(Proplist) -> gen_server:call(?SERVER, {add_config, Proplist}).
 add_repos(Name) -> gen_server:call(?SERVER, {add_repos, Name}).
 remove_repos(Name) -> gen_server:call(?SERVER, {remove_repos, Name}).
+add_user_to_repos(UserName, Name) -> gen_server:call(?SERVER, {add_user_to_repos, Name, UserName, members}).
 add_user_to_repos(UserName, Name, Type) -> gen_server:call(?SERVER, {add_user_to_repos, Name, UserName, Type}).
+remove_user_from_repos(UserName, Name) -> gen_server:call(?SERVER, {remove_user_from_repos, Name, UserName, members}).
 remove_user_from_repos(UserName, Name, Type) -> gen_server:call(?SERVER, {remove_user_from_repos, Name, UserName, Type}).
 add_user(UserName, Pubkey) -> gen_server:call(?SERVER, {add_new_user_and_key, UserName, Pubkey}).
-flush() -> gen_server:call(?SERVER, {flush}).
+make_repos_public(Name) -> gen_server:call(?SERVER, {make_repos_public, Name}).
+make_repos_private(Name) -> gen_server:call(?SERVER, {make_repos_private, Name}).
+flush() -> gen_server:cast(?SERVER, {flush}).
 reload() -> gen_server:call(?SERVER, {reload}).
 commit() -> gen_server:cast(?SERVER, {commit}).
   
@@ -84,8 +92,8 @@ init([]) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling call messages
 %%--------------------------------------------------------------------
-handle_call({show}, _From, #state{config = Config} = State) ->
-  Reply = handle_show(Config),
+handle_call({list_repos}, _From, #state{config = Config} = State) ->
+  Reply = handle_list_repos(Config),
   {reply, Reply, State};
 handle_call({add_config, Proplist}, _From, #state{config = Config} = State) ->
   NewState = handle_add_config(Proplist, Config, State),
@@ -105,8 +113,14 @@ handle_call({remove_user_from_repos, Name, UserName, Type}, _From, State) ->
 handle_call({add_new_user_and_key, UserName, Pubkey}, _From, State) ->
   NewState = handle_add_new_user_and_key(UserName, Pubkey, State),
   {reply, ok, NewState};
-handle_call({flush}, _From, State) ->
-  Reply = flush(State),
+handle_call({make_repos_public, Name}, _From, State) ->
+  NewState = handle_make_repos_public(Name, State),
+  {reply, ok, NewState};
+handle_call({make_repos_private, Name}, _From, State) ->
+  NewState = handle_make_repos_private(Name, State),
+  {reply, ok, NewState};
+handle_call({has_git_repos, Name}, _From, #state{config = Config} = State) ->
+  Reply = lists:member(Name, handle_list_repos(Config)),
   {reply, Reply, State};
 handle_call({reload}, _From, #state{gitosis_config = ConfigFile} = State) ->
   Config = conf_reader:parse_file(ConfigFile),
@@ -121,9 +135,14 @@ handle_call(_Request, _From, State) ->
 %%                                      {stop, Reason, State}
 %% Description: Handling cast messages
 %%--------------------------------------------------------------------
+handle_cast({flush}, State) ->
+  flush(State),
+  {noreply, State};
 handle_cast({commit}, #state{gitosis_config = ConfigFile} = State) ->
   handle_commit(ConfigFile),
-  {noreply, State};
+  flush(State),
+  Config = conf_reader:parse_file(ConfigFile),
+  {noreply, State#state{config = Config}};
 handle_cast(_Msg, State) ->
   {noreply, State}.
 
@@ -168,15 +187,15 @@ handle_add_config(Proplist, Config, State) ->
   flush(NewState),
   NewState.
 
-handle_show(Config) -> handle_show(Config, []).
-handle_show([], Acc) -> lists:reverse(Acc);
-handle_show([{K, _V}|Rest], Acc) ->
+handle_list_repos(Config) -> handle_list_repos(Config, []).
+handle_list_repos([], Acc) -> lists:reverse(Acc);
+handle_list_repos([{K, _V}|Rest], Acc) ->
   Key = erlang:atom_to_list(K),
   case string:substr(Key, 1, 6) =:= "group " of
     true -> 
       Name = string:substr(Key, 7, string:len(Key)),
-      handle_show(Rest, [Name|Acc]);
-    false -> handle_show(Rest, Acc)
+      handle_list_repos(Rest, [Name|Acc]);
+    false -> handle_list_repos(Rest, Acc)
   end.
   
 handle_add_repos(undefined, _Config, State) -> State;
@@ -247,7 +266,6 @@ handle_remove_user_from_repos(Name, UserName, Type, #state{config = Config} = St
       NewState = State#state{config = NewConfig},
       flush(NewState),
       NewState
-      
   end.
 
 handle_add_new_user_and_key(UserName, Pubkey, #state{gitosis_config = ConfigFile} = State) ->
@@ -261,7 +279,34 @@ handle_add_new_user_and_key(UserName, Pubkey, #state{gitosis_config = ConfigFile
     {ok, _Pubname}  -> ok
   end,
   State.
-
+  
+handle_make_repos_public(Name, State) ->
+  handle_change_repos_config(Name, daemon, ["yes"], State).
+handle_make_repos_private(Name, State) ->
+  handle_change_repos_config(Name, daemon, ["no"], State).
+    
+handle_change_repos_config(RepoName, ConfigKey, ConfigVal, #state{config = Config} = State) ->
+  case find_already_defined_repos(RepoName, Config) of
+    {error, not_found} -> ok;
+    {ok, Key, ReposConfig} ->
+      NewReposConfig = case proplists:get_value(ConfigKey, ReposConfig) of
+        undefined -> 
+          [{ConfigKey, ConfigVal}|ReposConfig];
+        Status ->
+          case Status =:= ConfigVal of
+            false ->
+              OldRepos = proplists:delete(ConfigKey, ReposConfig),
+              [{daemon, ConfigVal}|OldRepos];
+            true -> ReposConfig
+          end
+      end,
+      OldConfig = proplists:delete(Key, Config),
+      NewConfig = [{Key, NewReposConfig}|OldConfig],
+      NewState = State#state{config = NewConfig},
+      flush(NewState),
+      NewState
+  end.
+  
 find_already_defined_repos(_Name, []) -> {error, not_found};
 find_already_defined_repos(Name, [{K, V}|Rest]) ->
   Key = erlang:atom_to_list(K),
@@ -290,4 +335,6 @@ handle_commit(ConfigFile) ->
   Command = lists:append(["cd ", Dirname, " && ", 
     "git add . && ",
     "git commit -a -m 'Updated from erlosis'", " && ", "git push origin master"]),
-  os:cmd(Command).
+  Out = os:cmd(Command),
+  io:format("Out: ~p~n", [Out]),
+  Out.

@@ -15,12 +15,6 @@ all: compile
 compile:
 	@$(ERL) -pa $(EBIN_DIRS) -pa $(EBIN) -noinput +B -eval 'case make:all() of up_to_date -> halt(0); error -> halt(1) end.'
 
-run: compile
-	$(ERL) 	-pa $(EBIN) \
-					-pa deps/*/ebin \
-					-s reloader \
-					-s erlosis_srv start_link "env/gitosis.conf"
-
 boot:
 	(cd ebin; $(ERL) -pa src -pa ebin -pz deps/*/ebin -noshell -run make_boot write_scripts $(APP) $(VERSION);)
 
