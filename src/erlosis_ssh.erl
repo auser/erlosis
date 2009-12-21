@@ -10,8 +10,8 @@
 -behaviour(ssh_channel).
 
 %% API
--export([ssh_fox/3,ssh_data/1]).
--export([start_link/4]).
+-export([ssh_fox/3,ssh_data/1,ssh_error/1]).
+-export([start_link/1]).
 
 %% ssh_channel callbacks
 -export([init/1, handle_call/3, handle_msg/2, handle_ssh_msg/2, terminate/2]).
@@ -20,7 +20,9 @@
   channel_id,
   connection_ref,
   command,
-  callback
+  on_success,
+  on_error,
+  should_close = false
 }).
 -define(SERVER, ?MODULE).
 -define (TIMEOUT, 5000).
@@ -30,16 +32,23 @@
 %%====================================================================
 ssh_data(Data) ->
   io:format("[ssh] ~p~n", [Data]).
+ssh_error(Data) ->
+  io:format("[ssh error] ~p~n", [Data]).
   
 ssh_fox(Host, Cmd, Opts) ->
   UserDir = parse_opts(user_dir, Opts, "/home/git"),
   User = parse_opts(user, Opts, "git"),
-  {callback, Callback} = parse_opts(callback, Opts, fun ?MODULE:ssh_data/1),
-  SshOpts = lists:append([[UserDir], [User]]),
+  {on_success, OnSuccess} = parse_opts(on_success, Opts, fun ?MODULE:ssh_data/1),
+  {on_error, OnError} = parse_opts(on_error, Opts, fun ?MODULE:ssh_error/1),
+    
+  SshOpts = [
+    UserDir, User,{silently_accept_hosts, true}, {key_cb, ?MODULE}
+  ],
   
+  io:format("SshOpts: ~p~n", [SshOpts]),
   case ssh:connect(Host, 22, [SshOpts]) of
     {ok, ConnRef} ->
-      session(Cmd, ConnRef, Callback);
+      session(Cmd, ConnRef, OnSuccess, OnError);
     Error ->
       Error
   end.
@@ -50,11 +59,12 @@ parse_opts(Prop, Proplist, Default) ->
     E -> {Prop, E}
   end.
 
-session(Cmd, ConnRef, Callback) ->
+session(Cmd, ConnRef, OnSuccess, OnError) ->
   case ssh_connection:session_channel(ConnRef, ?TIMEOUT) of
     {ok, Channel} ->
       RealCmd = lists:flatten(lists:append([Cmd, "\n"])),
-      ssh_channel:start_link(ConnRef, Channel, ?MODULE, [RealCmd,Callback,ConnRef,Channel]);
+      Opts = [{command, RealCmd}, {connection_ref, ConnRef}, {channel, Channel}, {on_success, OnSuccess}, {on_error, OnError}],
+      ssh_channel:start_link(ConnRef, Channel, ?MODULE, [Opts]);
     Error ->
       error_logger:error_msg("Session Error: ~p~n", [Error])
   end.
@@ -63,8 +73,8 @@ session(Cmd, ConnRef, Callback) ->
 %% Function: start_link() -> {ok,Pid} | ignore | {error,Error}
 %% Description: Starts the server
 %%--------------------------------------------------------------------
-start_link(Cmd,Callback, ConnRef,Channel) ->
-  gen_server:start_link({local, ?SERVER}, ?MODULE, [Cmd,Callback,ConnRef,Channel], []).
+start_link(Opts) ->
+  gen_server:start_link({local, ?SERVER}, ?MODULE, [Opts], []).
 
 %%====================================================================
 %% gen_server callbacks
@@ -77,10 +87,17 @@ start_link(Cmd,Callback, ConnRef,Channel) ->
 %%                         {stop, Reason}
 %% Description: Initiates the server
 %%--------------------------------------------------------------------
-init([Cmd,Callback,ConnRef,Channel]) ->
+init([Opts]) ->
+  Cmd = proplists:get_value(command, Opts),
+  SuccessCallback = proplists:get_value(on_success, Opts),
+  ErrorCallback = proplists:get_value(on_error, Opts),
+  ConnRef = proplists:get_value(connection_ref, Opts),
+  Channel = proplists:get_value(channel, Opts),
+
   {ok, #state{
     command = Cmd, 
-    callback = Callback,
+    on_success = SuccessCallback,
+    on_error = ErrorCallback,
     connection_ref = ConnRef,
     channel_id = Channel
   }}.
@@ -118,11 +135,15 @@ handle_msg(Msg, State) ->
 %%                                       {stop, Reason, State}
 %% Description: Handling all non call/cast messages
 %%--------------------------------------------------------------------
-handle_ssh_msg({ssh_cm, ConnRef, {data, ChanId, _, Data}}, #state{channel_id = ChanId, connection_ref = ConnRef, callback = Callback} = State) ->
+handle_ssh_msg({ssh_cm, ConnRef, {data, ChanId, _, Data}}, #state{channel_id = ChanId, connection_ref = ConnRef, on_success = Callback} = State) ->
   Callback(Data),
+  {stop, ChanId, State};
+% For now, just quit after an exit_status
+handle_ssh_msg({ssh_cm, ConnRef, {exit_status, ChanId, 0}}, #state{channel_id = ChanId, connection_ref = ConnRef} = State) ->
   {ok, State};
-handle_ssh_msg({ssh_cm, ConnRef, {exit_status, ChanId, _Code}}, #state{channel_id = ChanId, connection_ref = ConnRef} = State) ->
-  {ok, State};
+handle_ssh_msg({ssh_cm, ConnRef, {exit_status, ChanId, Code}}, #state{channel_id = ChanId, connection_ref = ConnRef, on_error = Callback} = State) ->
+  Callback(Code),
+  {stop, ChanId, State};
 handle_ssh_msg({ssh_cm, ConnRef, {eof, ChanId}}, #state{channel_id = ChanId, connection_ref = ConnRef} = State) ->
   {stop, ChanId, State};
 handle_ssh_msg(Info, State) ->
